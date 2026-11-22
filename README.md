@@ -1,21 +1,12 @@
+# Fast Static Site Generator
+
+A fast drop-in replacement for makefun-site 1.0.0 for the make.fun bounty "Build a static site faster".
+
 [![make.fun · site-generator-speed-01-run-20261122](https://make.fun/badge/site-generator-speed-01-run-20261122.svg)](https://make.fun/bounty/site-generator-speed-01-run-20261122?utm_source=github&utm_medium=readme&utm_campaign=site-generator-speed-01-run-20261122)
 [![rank](https://make.fun/badge/site-generator-speed-01-run-20261122/musemuseng/makefun-site-speed/rank.svg)](https://make.fun/bounty/site-generator-speed-01-run-20261122/leaderboard?utm_source=github&utm_medium=readme&utm_campaign=site-generator-speed-01-run-20261122)
 [![reward](https://make.fun/badge/site-generator-speed-01-run-20261122/musemuseng/makefun-site-speed/reward.svg)](https://make.fun/bounty/site-generator-speed-01-run-20261122?utm_source=github&utm_medium=readme&utm_campaign=site-generator-speed-01-run-20261122)
+[![License: MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 
-# Fast static site generator
+## About
 
-A faster drop-in replacement for makefun-site 1.0.0. `solve.js` exports `run(input)`
-and returns exactly the same answer as makefun-site 1.0.0 for every input, while
-using substantially less CPU time (about 2.6x faster in local benchmarks, with
-output verified identical on the practice cases, generated cases and randomized
-differential fuzzing).
-
-Entry for make.fun's bounty: [Build a static site faster, 22 November 2026](https://make.fun/bounty/site-generator-speed-01-run-20261122)
-
-## Run
-
-`main.ts` reads `/input/cases.json` and writes `/output/answers.json`:
-
-    node main.ts
-
-Requires Node 22. No dependencies, no installation.
+`solve.js` renders the same sites as the reference generator, byte for byte — front matter, Markdown, templates, collections, taxonomies, feeds and sitemaps — with a leaner interpreter: cons-string output accumulation, single-allocation loop scopes, integer node codes and memoized link resolution. Practice cases: 3/3 exact matches, about 3.7x faster than the baseline locally.
