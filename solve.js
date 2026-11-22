@@ -7,11 +7,26 @@
 
 const ESCAPES = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' };
 const ESC_RE = /[&<>"']/g;
-const ESC_TEST = /[&<>"']/;
 
+// One regex scan, copying the plain spans between escapes in bulk (the same
+// trick as the inline renderer); measurably faster than replace-with-callback.
+// Runs to completion synchronously, so the shared regex is safe.
 export function escapeHtml(text) {
-  if (!ESC_TEST.test(text)) return text;
-  return text.replace(ESC_RE, (c) => ESCAPES[c]);
+  ESC_RE.lastIndex = 0;
+  let m = ESC_RE.exec(text);
+  if (m === null) return text;
+  let out = '';
+  let i = 0;
+  while (m !== null) {
+    const j = m.index;
+    if (j > i) out += text.slice(i, j);
+    out += ESCAPES[m[0]];
+    i = j + 1;
+    ESC_RE.lastIndex = i;
+    m = ESC_RE.exec(text);
+  }
+  if (i < text.length) out += text.slice(i);
+  return out;
 }
 
 const SLUG_MAX = 64;
@@ -208,30 +223,41 @@ const ESCAPABLE = new Set(['\\', '`', '*', '_', '[', ']', '(', ')', '#', '+', '-
 const INLINE_SPECIAL = /[\\`*\[&<>"']/;
 const WS_TEST = /\s/;
 
+// The left-to-right scanner of the reference skips the character after a
+// backslash when that character is escapable. A position j is therefore
+// visited by the scanner unless it is covered by such a skip, which happens
+// exactly when the run of backslashes immediately before j (not reaching
+// back before `from`) has odd length: the scanner enters the run at its
+// first backslash (nothing before it can skip it) and steps two at a time
+// through the run, since every character inside the run, and the one the
+// search is looking for ('*' or ']', both escapable), can follow a backslash.
+// So occurrences can be found with indexOf and filtered by that parity.
+function isSkipped(s, j, from) {
+  let run = 0;
+  for (let p = j - 1; p >= from && s[p] === '\\'; p--) run++;
+  return (run & 1) === 1;
+}
+
 function findUnescaped(s, what, from) {
-  for (let j = from; j <= s.length - what.length; j++) {
-    if (s[j] === '\\' && j + 1 < s.length && ESCAPABLE.has(s[j + 1])) {
-      j++;
-      continue;
-    }
-    if (s.startsWith(what, j)) return j;
+  let j = s.indexOf(what, from);
+  while (j !== -1) {
+    if (!isSkipped(s, j, from)) return j;
+    j = s.indexOf(what, j + 1);
   }
   return -1;
 }
 
 function findSingleStar(s, from) {
-  for (let j = from; j < s.length; j++) {
-    const c = s[j];
-    if (c === '\\' && j + 1 < s.length && ESCAPABLE.has(s[j + 1])) {
-      j++;
-      continue;
+  let j = s.indexOf('*', from);
+  while (j !== -1) {
+    if (!isSkipped(s, j, from)) {
+      if (s[j + 1] === '*') {
+        j = s.indexOf('*', j + 2);
+        continue;
+      }
+      return j;
     }
-    if (c !== '*') continue;
-    if (s[j + 1] === '*') {
-      j++;
-      continue;
-    }
-    return j;
+    j = s.indexOf('*', j + 1);
   }
   return -1;
 }
@@ -410,11 +436,24 @@ function trimLine(line) {
   return s === 0 && e === line.length ? line : line.slice(s, e);
 }
 
+// headingOf without the object allocation and the slice, for endsParagraph.
+function isHeading(line) {
+  let n = 0;
+  while (n < line.length && line[n] === '#') n++;
+  if (n > 6) return false;
+  if (n === line.length || (line[n] !== ' ' && line[n] !== '\t')) return false;
+  let s = n;
+  while (s < line.length && (line[s] === ' ' || line[s] === '\t')) s++;
+  let e = line.length;
+  while (e > s && (line[e - 1] === ' ' || line[e - 1] === '\t')) e--;
+  return e > s;
+}
+
 function endsParagraph(line) {
   if (line === '') return true;
   const c0 = line[0];
   if (c0 === '`') return fenceLang(line) !== null;
-  if (c0 === '#') return headingOf(line) !== null;
+  if (c0 === '#') return isHeading(line);
   if (c0 === '-' || c0 === '*') return isHr(line);
   if (c0 === ' ' || c0 === '\t') return isBlank(line);
   return false;
@@ -592,36 +631,36 @@ function parseTemplate(name, src) {
   const stack = [root];
   let body = root.body;
   for (const tok of tokenize(name, src)) {
-    if (tok.t === 'text') body.push({ kind: 'text', text: tok.text });
-    else if (tok.t === 'var' || tok.t === 'raw') body.push({ kind: tok.t, path: tok.path });
+    if (tok.t === 'text') body.push({ kind: K_TEXT, text: tok.text });
+    else if (tok.t === 'var' || tok.t === 'raw') body.push({ kind: tok.t === 'var' ? K_VAR : K_RAW, path: tok.path });
     else {
       const tag = tok.tag;
       const top = stack[stack.length - 1];
       let m;
       if ((m = TPL_FOR.exec(tag)) !== null) {
-        const node = { kind: 'for', name: m[1], path: pathOf(name, m[2]), body: [] };
+        const node = { kind: K_FOR, name: m[1], path: pathOf(name, m[2]), body: [] };
         body.push(node);
         stack.push(node);
         body = node.body;
       } else if ((m = TPL_IF.exec(tag)) !== null) {
-        const node = { kind: 'if', not: m[1] !== undefined, path: pathOf(name, m[2]), then: [], else: null };
+        const node = { kind: K_IF, not: m[1] !== undefined, path: pathOf(name, m[2]), then: [], else: null };
         body.push(node);
         stack.push(node);
         body = node.then;
       } else if (tag === 'else') {
-        if (top.kind !== 'if' || top.else !== null) throw new TemplateError(`template "${name}": an else outside an if`);
+        if (top.kind !== K_IF || top.else !== null) throw new TemplateError(`template "${name}": an else outside an if`);
         top.else = [];
         body = top.else;
       } else if (tag === 'endfor' || tag === 'endif') {
-        if (top.kind !== (tag === 'endfor' ? 'for' : 'if')) throw new TemplateError(`template "${name}": an ${tag} with no open ${tag.slice(3)}`);
+        if (top.kind !== (tag === 'endfor' ? K_FOR : K_IF)) throw new TemplateError(`template "${name}": an ${tag} with no open ${tag.slice(3)}`);
         stack.pop();
         const parent = stack[stack.length - 1];
-        body = parent.kind === 'root' ? parent.body : parent.kind === 'for' ? parent.body : parent.else ?? parent.then;
-      } else if ((m = TPL_INCLUDE.exec(tag)) !== null) body.push({ kind: 'include', name: m[1] });
+        body = parent.kind === 'root' ? parent.body : parent.kind === K_FOR ? parent.body : parent.else ?? parent.then;
+      } else if ((m = TPL_INCLUDE.exec(tag)) !== null) body.push({ kind: K_INCLUDE, name: m[1] });
       else throw new TemplateError(`template "${name}": {% ${tag} %} is not a tag`);
     }
   }
-  if (stack.length > 1) throw new TemplateError(`template "${name}": a ${stack[stack.length - 1].kind} is not closed`);
+  if (stack.length > 1) throw new TemplateError(`template "${name}": a ${stack[stack.length - 1].kind === K_FOR ? 'for' : 'if'} is not closed`);
   return root.body;
 }
 
@@ -650,38 +689,59 @@ function truthy(v) {
   return v !== undefined && v !== null && v !== false && v !== '' && v !== 0;
 }
 
+// Node kinds as small ints, assigned in parseTemplate.
+const K_TEXT = 0, K_VAR = 1, K_RAW = 2, K_IF = 3, K_FOR = 4, K_INCLUDE = 5;
+
 // Renders into `out` (an array of strings) instead of concatenating at every node.
-// ctx.templates maps a name to its parsed node tree.
+// ctx.templates maps a name to its parsed node tree. A for loop allocates one
+// scope (and one loop object) per loop execution, not per item: the item
+// variable and the loop fields are mutated between items, which no observer
+// can tell apart from fresh objects because rendering is synchronous.
 function renderInto(nodes, scope, ctx, depth, out) {
-  for (let idx = 0; idx < nodes.length; idx++) {
+  const len = nodes.length;
+  for (let idx = 0; idx < len; idx++) {
     const n = nodes[idx];
     switch (n.kind) {
-      case 'text':
-        out.push(n.text);
+      case K_TEXT:
+        out.s += n.text;
         break;
-      case 'var':
-        out.push(escapeHtml(textOf(lookup(scope, n.path))));
+      case K_VAR: {
+        const v = lookup(scope, n.path);
+        out.s += (escapeHtml(typeof v === 'string' ? v : textOf(v)));
         break;
-      case 'raw':
-        out.push(textOf(lookup(scope, n.path)));
+      }
+      case K_RAW: {
+        const v = lookup(scope, n.path);
+        out.s += (typeof v === 'string' ? v : textOf(v));
         break;
-      case 'if': {
+      }
+      case K_IF: {
         const v = truthy(lookup(scope, n.path));
         const branch = v !== n.not ? n.then : n.else;
         if (branch !== null) renderInto(branch, scope, ctx, depth, out);
         break;
       }
-      case 'for': {
+      case K_FOR: {
         const xs = lookup(scope, n.path);
         if (!Array.isArray(xs)) break;
-        const len = xs.length;
-        for (let k = 0; k < len; k++) {
-          const vars = { [n.name]: xs[k], loop: { index: k + 1, first: k === 0, last: k === len - 1, length: len } };
-          renderInto(n.body, { vars, parent: scope }, ctx, depth, out);
+        const count = xs.length;
+        if (count === 0) break;
+        const vars = {};
+        const loop = { index: 0, first: false, last: false, length: count };
+        const child = { vars, parent: scope };
+        const name = n.name;
+        const body = n.body;
+        for (let k = 0; k < count; k++) {
+          loop.index = k + 1;
+          loop.first = k === 0;
+          loop.last = k === count - 1;
+          vars[name] = xs[k];
+          vars.loop = loop;
+          renderInto(body, child, ctx, depth, out);
         }
         break;
       }
-      case 'include': {
+      case K_INCLUDE: {
         const t = ctx.templates.get(n.name);
         if (t !== undefined && depth < INCLUDE_DEPTH) renderInto(t, scope, ctx, depth + 1, out);
         break;
@@ -700,17 +760,17 @@ const REPORT_FILE = 'build-report.txt';
 const byCodeUnits = (a, b) => (a < b ? -1 : a > b ? 1 : 0);
 
 // Word count (runs of non-whitespace) without allocating the match array.
+// The common case (an ASCII non-space) takes the shortest branch.
 function wordsOf(text) {
   let count = 0;
   let inWord = false;
   for (let i = 0; i < text.length; i++) {
     const code = text.charCodeAt(i);
-    let ws;
-    if (code === 32 || (code >= 9 && code <= 13)) ws = true;
-    else if (code < 128) ws = false;
-    else ws = WS_TEST.test(text[i]);
-    if (ws) inWord = false;
-    else if (!inWord) {
+    if (code === 32 || (code >= 9 && code <= 13)) {
+      inWord = false;
+    } else if (code > 127 && WS_TEST.test(text[i])) {
+      inWord = false;
+    } else if (!inWord) {
       inWord = true;
       count++;
     }
@@ -824,21 +884,30 @@ export function build(input) {
     bySource.set(s.path, s);
   }
 
-  // 4. Markdown with link resolution.
+  // 4. Markdown with link resolution. Resolutions repeat a lot inside one
+  // case (the same target from many pages), so they are memoised per case;
+  // the broken-link side effect is replayed from the memo on every call.
   const staticPaths = new Set(statics.map((f) => f.path));
+  const linkMemo = new Map();
   for (const s of kept) {
     const dir = dirOf(s.path);
     const env = {
       link: (target) => {
         if (SCHEME.test(target) || target.startsWith('/') || target.startsWith('#')) return target;
-        const hash = target.indexOf('#');
-        const rel = hash === -1 ? target : target.slice(0, hash);
-        const frag = hash === -1 ? '' : target.slice(hash);
-        const path = rel === '' ? null : resolvePath(dir, rel);
-        if (path !== null && bySource.has(path)) return `${bySource.get(path).url}${frag}`;
-        if (path !== null && staticPaths.has(path)) return `${base}/${path}${frag}`;
-        broken.add(`broken-link ${s.path} -> ${target}`);
-        return target;
+        const key = dir + '\n' + target;
+        let r = linkMemo.get(key);
+        if (r === undefined) {
+          const hash = target.indexOf('#');
+          const rel = hash === -1 ? target : target.slice(0, hash);
+          const frag = hash === -1 ? '' : target.slice(hash);
+          const path = rel === '' ? null : resolvePath(dir, rel);
+          if (path !== null && bySource.has(path)) r = { url: `${bySource.get(path).url}${frag}`, broken: false };
+          else if (path !== null && staticPaths.has(path)) r = { url: `${base}/${path}${frag}`, broken: false };
+          else r = { url: target, broken: true };
+          linkMemo.set(key, r);
+        }
+        if (r.broken) broken.add(`broken-link ${s.path} -> ${target}`);
+        return r.url;
       },
     };
     const md = renderMarkdown(s.body, env, slug);
@@ -893,12 +962,21 @@ export function build(input) {
   const tags = [...bySlug.values()].sort((x, y) => y.posts.length - x.posts.length || byCodeUnits(x.slug, y.slug));
 
   // Cards, computed once per source and shared by every view of the page.
-  const linkOf = (s) => (s === null ? null : { title: s.data.title, url: s.url, date: s.data.date ?? '', date_long: s.data.date === undefined ? '' : longDate(s.data.date) });
+  const longDateCache = new Map();
+  const longDateOf = (date) => {
+    let v = longDateCache.get(date);
+    if (v === undefined) {
+      v = longDate(date);
+      longDateCache.set(date, v);
+    }
+    return v;
+  };
+  const linkOf = (s) => (s === null ? null : { title: s.data.title, url: s.url, date: s.data.date ?? '', date_long: s.data.date === undefined ? '' : longDateOf(s.data.date) });
   const cardOf = (s) => ({
     title: s.data.title,
     url: s.url,
     date: s.data.date ?? '',
-    date_long: s.data.date === undefined ? '' : longDate(s.data.date),
+    date_long: s.data.date === undefined ? '' : longDateOf(s.data.date),
     summary: s.data.summary ?? '',
     excerpt: s.excerpt,
     reading_minutes: Math.max(1, Math.ceil(wordsOf(s.body) / 200)),
@@ -921,14 +999,13 @@ export function build(input) {
   const allTags = tags.map((t) => ({ name: t.name, slug: t.slug, url: t.url, count: t.posts.length }));
   const recent = posts.slice(0, input.site.recent).map((p) => cards.get(p));
   const ctx = { templates };
+  const rootScope = { vars: { site, tags: allTags, recent }, parent: null };
   const render = (name, vars) => {
     const nodes = templates.get(name);
     if (nodes === undefined) return null;
-    const scopeVars = { site, tags: allTags, recent };
-    for (const k of Object.keys(vars)) scopeVars[k] = vars[k];
-    const out = [];
-    renderInto(nodes, { vars: scopeVars, parent: null }, ctx, 0, out);
-    return out.join('');
+    const out = { s: '' };
+    renderInto(nodes, { vars, parent: rootScope }, ctx, 0, out);
+    return out.s;
   };
   for (const s of kept) output[`${s.outDir}/index.html`] = render(s.layout, { page: pageOf(s) });
   const per = input.site.per_page;
