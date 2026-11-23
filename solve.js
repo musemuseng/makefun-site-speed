@@ -54,24 +54,14 @@ function slugifyRef(text) {
 }
 
 // ASCII fast path: NFKD is the identity on ASCII and no ASCII char is a combining mark,
-// so the reference loop over code units gives the same result.
+// so the reference result is the runs of [a-z0-9] in the lowercased text joined by '-'.
+// toLowerCase and the run scan both run in native code.
+const SLUG_RUN = /[a-z0-9]+/g;
 function slugifyAscii(text) {
-  let out = '';
-  let gap = false;
-  for (let i = 0; i < text.length; i++) {
-    const code = text.charCodeAt(i);
-    let keep = -1;
-    if (code >= 65 && code <= 90) keep = code + 32;
-    else if ((code >= 97 && code <= 122) || (code >= 48 && code <= 57)) keep = code;
-    if (keep === -1) {
-      gap = out.length > 0;
-      continue;
-    }
-    if (gap) out += '-';
-    gap = false;
-    out += String.fromCharCode(keep);
-  }
-  out = out.slice(0, SLUG_MAX).replace(/-+$/, '');
+  const runs = text.toLowerCase().match(SLUG_RUN);
+  if (runs === null) return 'untitled';
+  let out = runs.join('-').slice(0, SLUG_MAX);
+  if (out.endsWith('-')) out = out.replace(/-+$/, '');
   return out === '' ? 'untitled' : out;
 }
 
@@ -170,39 +160,59 @@ function isBlankLine(line) {
   return true;
 }
 
+// Splits a front-matter line into [key, rawValue] by hand (FM_LINE's equivalent:
+// ^([a-z_]+):(?: (.*))?$), or returns null.
+function fmSplit(line) {
+  let i = 0;
+  const n = line.length;
+  while (i < n) {
+    const c = line.charCodeAt(i);
+    if ((c >= 97 && c <= 122) || c === 95) i++;
+    else break;
+  }
+  if (i === 0 || line[i] !== ':') return null;
+  if (i + 1 === n) return [line.slice(0, i), ''];
+  if (line[i + 1] !== ' ') return null;
+  return [line.slice(0, i), line.slice(i + 2)];
+}
+
 // { data, body } or { error }; walks lines by offset instead of split+join.
+// Pass 1 finds the closing '---' line without slicing (three char codes and a
+// length); pass 2 parses the lines in between, slicing each once.
 function parseFrontMatter(text) {
+  const len = text.length;
   const firstNl = text.indexOf('\n');
-  const firstLine = firstNl === -1 ? text : text.slice(0, firstNl);
-  if (firstLine !== '---') return { error: 'no front matter' };
-  // Find the closing line, remembering each line's text and the body's start offset.
-  const fmLines = []; // [lineIndex (1-based overall), lineText]
-  let close = -1;
-  let bodyStart = text.length;
-  let pos = firstNl === -1 ? text.length : firstNl + 1;
-  let idx = 1; // line index of the line starting at pos (0-based; first line is 0)
-  while (pos <= text.length) {
+  const firstEnd = firstNl === -1 ? len : firstNl;
+  if (firstEnd !== 3 || text.charCodeAt(0) !== 45 || text.charCodeAt(1) !== 45 || text.charCodeAt(2) !== 45) return { error: 'no front matter' };
+  let bodyStart = -1;
+  let closePos = -1;
+  let pos = firstNl === -1 ? len : firstNl + 1;
+  while (pos <= len) {
     const nl = text.indexOf('\n', pos);
-    const end = nl === -1 ? text.length : nl;
-    const line = text.slice(pos, end);
-    if (line === '---') {
-      close = idx;
-      bodyStart = nl === -1 ? text.length : nl + 1;
+    const end = nl === -1 ? len : nl;
+    if (end - pos === 3 && text.charCodeAt(pos) === 45 && text.charCodeAt(pos + 1) === 45 && text.charCodeAt(pos + 2) === 45) {
+      bodyStart = nl === -1 ? len : nl + 1;
+      closePos = pos;
       break;
     }
-    fmLines.push([idx, line]);
     if (nl === -1) break;
     pos = nl + 1;
-    idx++;
   }
-  if (close === -1) return { error: 'the front matter is not closed' };
+  if (bodyStart === -1) return { error: 'the front matter is not closed' };
   const data = {};
-  for (const [i, line] of fmLines) {
-    if (isBlankLine(line) || line.startsWith('#')) continue;
-    const m = FM_LINE.exec(line);
-    if (!m) return { error: `line ${i + 1} is not "key: value"` };
-    const key = m[1];
-    let raw = m[2] ?? '';
+  pos = firstNl === -1 ? len : firstNl + 1;
+  let idx = 1; // line index of the line starting at pos (0-based; first line is 0)
+  while (pos < closePos) {
+    const nl = text.indexOf('\n', pos);
+    const end = nl === -1 ? len : nl;
+    const line = text.slice(pos, end);
+    idx++;
+    pos = nl === -1 ? len : nl + 1;
+    if (isBlankLine(line) || line.charCodeAt(0) === 35) continue;
+    const kv = fmSplit(line);
+    if (kv === null) return { error: `line ${idx} is not "key: value"` };
+    const key = kv[0];
+    let raw = kv[1];
     let e = raw.length;
     while (e > 0 && (raw[e - 1] === ' ' || raw[e - 1] === '\t')) e--;
     if (e !== raw.length) raw = raw.slice(0, e);
@@ -238,20 +248,22 @@ function isSkipped(s, j, from) {
   return (run & 1) === 1;
 }
 
-function findUnescaped(s, what, from) {
+// Bounded variants: the occurrence must fit inside [from, hi), exactly as if
+// the search ran on the substring s.slice(lo, hi) (see inlineInto below).
+function findUnescaped(s, what, from, hi) {
   let j = s.indexOf(what, from);
-  while (j !== -1) {
+  while (j !== -1 && j + what.length <= hi) {
     if (!isSkipped(s, j, from)) return j;
     j = s.indexOf(what, j + 1);
   }
   return -1;
 }
 
-function findSingleStar(s, from) {
+function findSingleStar(s, from, hi) {
   let j = s.indexOf('*', from);
-  while (j !== -1) {
+  while (j !== -1 && j < hi) {
     if (!isSkipped(s, j, from)) {
-      if (s[j + 1] === '*') {
+      if (j + 1 < hi && s[j + 1] === '*') {
         j = s.indexOf('*', j + 2);
         continue;
       }
@@ -262,90 +274,122 @@ function findSingleStar(s, from) {
   return -1;
 }
 
+// escapeHtml over the range [lo, hi) of s, appending pieces to out.
+function escapeInto(s, lo, hi, out) {
+  ESC_RE.lastIndex = lo;
+  let m = ESC_RE.exec(s);
+  if (m === null || m.index >= hi) {
+    if (hi > lo) out.push(s.slice(lo, hi));
+    return;
+  }
+  let i = lo;
+  while (m !== null && m.index < hi) {
+    const j = m.index;
+    if (j > i) out.push(s.slice(i, j));
+    out.push(ESCAPES[m[0]]);
+    i = j + 1;
+    ESC_RE.lastIndex = i;
+    m = ESC_RE.exec(s);
+  }
+  if (i < hi) out.push(s.slice(i, hi));
+}
+
 // Inline rendering: same left-to-right rules as the reference, but the scan jumps
 // from special character to special character (one regex pass, in native code) and
 // copies the plain spans between them in bulk: they hold no character that
-// escaping would change. The shared regex's lastIndex is saved and restored
-// around recursive calls, which scan other strings.
+// escaping would change. Nested constructs render into the same output array
+// over index ranges of the original string, so no substring is ever built for
+// them; the shared regex's lastIndex is reset before every exec, which is all
+// the discipline the recursion needs.
 const NEXT_SPECIAL = /[\\`*\[&<>"']/g;
 
-function inline(s, env) {
-  NEXT_SPECIAL.lastIndex = 0;
+function inlineInto(s, lo, hi, env, out) {
+  NEXT_SPECIAL.lastIndex = lo;
   let m = NEXT_SPECIAL.exec(s);
-  if (m === null) return s;
-  let out = '';
-  let i = 0;
-  const n = s.length;
-  while (m !== null) {
+  if (m === null || m.index >= hi) {
+    if (hi > lo) out.push(lo === 0 && hi === s.length ? s : s.slice(lo, hi));
+    return;
+  }
+  let i = lo;
+  while (m !== null && m.index < hi) {
     const j = m.index;
-    if (j > i) out += s.slice(i, j);
+    if (j > i) out.push(s.slice(i, j));
     i = j;
     const c = s[i];
     if (c === '\\') {
-      if (i + 1 < n && ESCAPABLE.has(s[i + 1])) {
+      if (i + 1 < hi && ESCAPABLE.has(s[i + 1])) {
         const e = ESCAPES[s[i + 1]];
-        out += e === undefined ? s[i + 1] : e;
+        out.push(e === undefined ? s[i + 1] : e);
         i += 2;
       } else {
-        out += '\\';
+        out.push('\\');
         i++;
       }
     } else if (c === '`') {
       const k = s.indexOf('`', i + 1);
-      if (k > i + 1) {
-        out += '<code>' + escapeHtml(s.slice(i + 1, k)) + '</code>';
+      if (k !== -1 && k < hi && k > i + 1) {
+        out.push('<code>');
+        escapeInto(s, i + 1, k, out);
+        out.push('</code>');
         i = k + 1;
       } else {
-        out += '`';
+        out.push('`');
         i++;
       }
     } else if (c === '*') {
-      if (s[i + 1] === '*') {
-        const k = findUnescaped(s, '**', i + 2);
+      if (i + 1 < hi && s[i + 1] === '*') {
+        const k = findUnescaped(s, '**', i + 2, hi);
         if (k > i + 2) {
-          const saved = NEXT_SPECIAL.lastIndex;
-          out += '<strong>' + inline(s.slice(i + 2, k), env) + '</strong>';
-          NEXT_SPECIAL.lastIndex = saved;
+          out.push('<strong>');
+          inlineInto(s, i + 2, k, env, out);
+          out.push('</strong>');
           i = k + 2;
         } else {
-          out += '**';
+          out.push('**');
           i += 2;
         }
       } else {
-        const k = findSingleStar(s, i + 1);
+        const k = findSingleStar(s, i + 1, hi);
         if (k > i + 1) {
-          const saved = NEXT_SPECIAL.lastIndex;
-          out += '<em>' + inline(s.slice(i + 1, k), env) + '</em>';
-          NEXT_SPECIAL.lastIndex = saved;
+          out.push('<em>');
+          inlineInto(s, i + 1, k, env, out);
+          out.push('</em>');
           i = k + 1;
         } else {
-          out += '*';
+          out.push('*');
           i++;
         }
       }
     } else if (c === '[') {
-      const k = findUnescaped(s, ']', i + 1);
-      const q = k !== -1 && s[k + 1] === '(' ? s.indexOf(')', k + 2) : -1;
+      const k = findUnescaped(s, ']', i + 1, hi);
+      let q = k !== -1 && s[k + 1] === '(' ? s.indexOf(')', k + 2) : -1;
+      if (q >= hi) q = -1;
       const target = q === -1 ? '' : s.slice(k + 2, q);
       if (target !== '' && !WS_TEST.test(target)) {
-        const saved = NEXT_SPECIAL.lastIndex;
-        out += '<a href="' + escapeHtml(env.link(target)) + '">' + inline(s.slice(i + 1, k), env) + '</a>';
-        NEXT_SPECIAL.lastIndex = saved;
+        out.push('<a href="' + escapeHtml(env.link(target)) + '">');
+        inlineInto(s, i + 1, k, env, out);
+        out.push('</a>');
         i = q + 1;
       } else {
-        out += '[';
+        out.push('[');
         i++;
       }
     } else {
       // One of & < > " ' (the only remaining specials).
-      out += ESCAPES[c];
+      out.push(ESCAPES[c]);
       i++;
     }
     NEXT_SPECIAL.lastIndex = i;
     m = NEXT_SPECIAL.exec(s);
   }
-  if (i < n) out += s.slice(i);
-  return out;
+  if (i < hi) out.push(s.slice(i, hi));
+}
+
+function inline(s, env) {
+  if (!INLINE_SPECIAL.test(s)) return s;
+  const out = [];
+  inlineInto(s, 0, s.length, env, out);
+  return out.join('');
 }
 
 /* Line classifiers: hand-written equivalents of the reference's regexes. */
@@ -483,12 +527,13 @@ function renderMarkdown(src, env, slug) {
       const lang = fenceLang(line);
       if (lang !== null) {
         i++;
-        let body = '';
+        const parts = [];
         while (i < n && !isFenceClose(lines[i])) {
-          body += escapeHtml(lines[i]) + '\n';
+          parts.push(escapeHtml(lines[i]));
           i++;
         }
         i++;
+        const body = parts.length === 0 ? '' : parts.join('\n') + '\n';
         const cls = lang === '' ? '' : ` class="language-${escapeHtml(lang)}"`;
         out += `<pre><code${cls}>${body}</code></pre>\n`;
         continue;
@@ -666,9 +711,15 @@ function parseTemplate(name, src) {
 
 function lookup(scope, path) {
   let s = scope;
-  while (s !== null && !Object.hasOwn(s.vars, path[0])) s = s.parent;
+  const k0 = path[0];
+  while (s !== null && !Object.hasOwn(s.vars, k0)) s = s.parent;
   if (s === null) return undefined;
-  let v = s.vars[path[0]];
+  let v = s.vars[k0];
+  if (path.length === 1) return v;
+  if (path.length === 2) {
+    const k1 = path[1];
+    return v !== null && typeof v === 'object' && Object.hasOwn(v, k1) ? v[k1] : undefined;
+  }
   for (let k = 1; k < path.length; k++) {
     if (v === null || typeof v !== 'object' || !Object.hasOwn(v, path[k])) return undefined;
     v = v[path[k]];
@@ -888,14 +939,18 @@ export function build(input) {
   // case (the same target from many pages), so they are memoised per case;
   // the broken-link side effect is replayed from the memo on every call.
   const staticPaths = new Set(statics.map((f) => f.path));
-  const linkMemo = new Map();
+  const linkMemo = new Map(); // dir -> Map<target, {url, broken}>
   for (const s of kept) {
     const dir = dirOf(s.path);
+    let dirMemo = linkMemo.get(dir);
+    if (dirMemo === undefined) {
+      dirMemo = new Map();
+      linkMemo.set(dir, dirMemo);
+    }
     const env = {
       link: (target) => {
-        if (SCHEME.test(target) || target.startsWith('/') || target.startsWith('#')) return target;
-        const key = dir + '\n' + target;
-        let r = linkMemo.get(key);
+        if (target.charCodeAt(0) === 47 || target.charCodeAt(0) === 35 || SCHEME.test(target)) return target;
+        let r = dirMemo.get(target);
         if (r === undefined) {
           const hash = target.indexOf('#');
           const rel = hash === -1 ? target : target.slice(0, hash);
@@ -904,7 +959,7 @@ export function build(input) {
           if (path !== null && bySource.has(path)) r = { url: `${bySource.get(path).url}${frag}`, broken: false };
           else if (path !== null && staticPaths.has(path)) r = { url: `${base}/${path}${frag}`, broken: false };
           else r = { url: target, broken: true };
-          linkMemo.set(key, r);
+          dirMemo.set(target, r);
         }
         if (r.broken) broken.add(`broken-link ${s.path} -> ${target}`);
         return r.url;
@@ -971,28 +1026,72 @@ export function build(input) {
     }
     return v;
   };
-  const linkOf = (s) => (s === null ? null : { title: s.data.title, url: s.url, date: s.data.date ?? '', date_long: s.data.date === undefined ? '' : longDateOf(s.data.date) });
-  const cardOf = (s) => ({
+  // Link views and tag views are shared by every card that mentions them.
+  const linkViews = new Map();
+  const linkOf = (s) => {
+    if (s === null) return null;
+    let v = linkViews.get(s);
+    if (v === undefined) {
+      v = { title: s.data.title, url: s.url, date: s.data.date ?? '', date_long: s.data.date === undefined ? '' : longDateOf(s.data.date) };
+      linkViews.set(s, v);
+    }
+    return v;
+  };
+  const tagViews = new Map();
+  const tagViewOf = (t) => {
+    let v = tagViews.get(t);
+    if (v === undefined) {
+      v = { name: t.name, slug: t.slug, url: t.url };
+      tagViews.set(t, v);
+    }
+    return v;
+  };
+  // reading_minutes is the only expensive card field (a full-body scan), and
+  // some layouts never read it: compute it lazily, at most once per source.
+  // The getter is invisible to templates beyond the value itself (own
+  // property, same name and value as the reference's eager field).
+  const rmCache = new Map();
+  const rmOf = (s) => {
+    let v = rmCache.get(s);
+    if (v === undefined) {
+      v = Math.max(1, Math.ceil(wordsOf(s.body) / 200));
+      rmCache.set(s, v);
+    }
+    return v;
+  };
+  const withRm = (obj, s) => {
+    Object.defineProperty(obj, 'reading_minutes', { enumerable: true, get: () => rmOf(s) });
+    return obj;
+  };
+  const cardOf = (s) => withRm({
     title: s.data.title,
     url: s.url,
     date: s.data.date ?? '',
     date_long: s.data.date === undefined ? '' : longDateOf(s.data.date),
     summary: s.data.summary ?? '',
     excerpt: s.excerpt,
-    reading_minutes: Math.max(1, Math.ceil(wordsOf(s.body) / 200)),
-    tags: s.tagRefs.map((t) => ({ name: t.name, slug: t.slug, url: t.url })),
-  });
+    tags: s.tagRefs.map(tagViewOf),
+  }, s);
   const cards = new Map();
   for (const s of kept) cards.set(s, cardOf(s));
-  const pageOf = (s) => ({
-    ...cards.get(s),
-    slug: s.slug,
-    content: s.html,
-    toc: s.toc,
-    newer: linkOf(s.newer ?? null),
-    older: linkOf(s.older ?? null),
-    is_post: s.post,
-  });
+  const pageOf = (s) => {
+    const c = cards.get(s);
+    return withRm({
+      title: c.title,
+      url: c.url,
+      date: c.date,
+      date_long: c.date_long,
+      summary: c.summary,
+      excerpt: c.excerpt,
+      tags: c.tags,
+      slug: s.slug,
+      content: s.html,
+      toc: s.toc,
+      newer: linkOf(s.newer ?? null),
+      older: linkOf(s.older ?? null),
+      is_post: s.post,
+    }, s);
+  };
 
   // 7. Layouts, index pages, tag pages, statics.
   const site = { title: input.site.title, base_url: base };
@@ -1000,11 +1099,16 @@ export function build(input) {
   const recent = posts.slice(0, input.site.recent).map((p) => cards.get(p));
   const ctx = { templates };
   const rootScope = { vars: { site, tags: allTags, recent }, parent: null };
+  // One scope object reused by every top-level render: rendering is
+  // synchronous and render() is never re-entered (includes go through
+  // renderInto with the scope they were given), so swapping .vars is safe.
+  const renderScope = { vars: null, parent: rootScope };
   const render = (name, vars) => {
     const nodes = templates.get(name);
     if (nodes === undefined) return null;
     const out = { s: '' };
-    renderInto(nodes, { vars, parent: rootScope }, ctx, 0, out);
+    renderScope.vars = vars;
+    renderInto(nodes, renderScope, ctx, 0, out);
     return out.s;
   };
   for (const s of kept) output[`${s.outDir}/index.html`] = render(s.layout, { page: pageOf(s) });
